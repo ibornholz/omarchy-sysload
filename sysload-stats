@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Collect system load figures for the Omarchy sysload bar widget.
+
+Prints one JSON object. CPU, per-process CPU and network throughput are
+deltas against the previous invocation, kept in a small state file under
+XDG_RUNTIME_DIR, so each call is cheap and reflects the last interval.
+"""
+import json
+import os
+import sys
+import time
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-sysload.json")
+TOP_N = 8
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def cpu_totals():
+    fields = read("/proc/stat").split("\n", 1)[0].split()[1:]
+    vals = [int(x) for x in fields]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return sum(vals), idle
+
+
+def meminfo():
+    out = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, rest = line.partition(":")
+        out[k] = int(rest.split()[0]) * 1024
+    total = out.get("MemTotal", 0)
+    avail = out.get("MemAvailable", 0)
+    st = out.get("SwapTotal", 0)
+    sf = out.get("SwapFree", 0)
+    return (
+        {"used": total - avail, "total": total, "pct": (total - avail) * 100 / total if total else 0},
+        {"used": st - sf, "total": st, "pct": (st - sf) * 100 / st if st else 0},
+    )
+
+
+def disk(path="/"):
+    try:
+        s = os.statvfs(path)
+    except OSError:
+        return {"used": 0, "total": 0, "pct": 0}
+    total = s.f_blocks * s.f_frsize
+    free = s.f_bavail * s.f_frsize
+    used = total - free
+    return {"used": used, "total": total, "pct": used * 100 / total if total else 0}
+
+
+def temperature():
+    preferred = ("coretemp", "k10temp", "zenpower", "cpu_thermal")
+    zones = []
+    base = "/sys/class/hwmon"
+    try:
+        for h in os.listdir(base):
+            name = read(f"{base}/{h}/name").strip()
+            val = read(f"{base}/{h}/temp1_input").strip()
+            if val:
+                zones.append((name, int(val) / 1000))
+    except OSError:
+        pass
+    for p in preferred:
+        for name, v in zones:
+            if name == p:
+                return round(v)
+    try:
+        for z in os.listdir("/sys/class/thermal"):
+            if read(f"/sys/class/thermal/{z}/type").strip() == "x86_pkg_temp":
+                return round(int(read(f"/sys/class/thermal/{z}/temp")) / 1000)
+    except (OSError, ValueError):
+        pass
+    return round(zones[0][1]) if zones else None
+
+
+def uptime():
+    secs = float(read("/proc/uptime", "0").split()[0])
+    d, r = divmod(int(secs), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def net_totals():
+    rx = tx = 0
+    for line in read("/proc/net/dev").splitlines()[2:]:
+        iface, _, rest = line.partition(":")
+        if iface.strip() == "lo":
+            continue
+        f = rest.split()
+        rx += int(f[0])
+        tx += int(f[8])
+    return rx, tx
+
+
+def processes():
+    """pid -> (name, cpu ticks, rss bytes). Threads are not listed."""
+    procs = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        stat = read(f"/proc/{pid}/stat")
+        if not stat:
+            continue
+        lp = stat.rfind(")")
+        name = stat[stat.find("(") + 1:lp]
+        rest = stat[lp + 2:].split()
+        try:
+            ticks = int(rest[11]) + int(rest[12])
+            rss = int(rest[21]) * PAGE
+        except (IndexError, ValueError):
+            continue
+        procs[int(pid)] = (name, ticks, rss)
+    return procs
+
+
+def sample():
+    total, idle = cpu_totals()
+    rx, tx = net_totals()
+    return {"t": time.time(), "total": total, "idle": idle, "rx": rx, "tx": tx, "procs": processes()}
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            s = json.load(f)
+        s["procs"] = {int(k): tuple(v) for k, v in s["procs"].items()}
+        return s
+    except (OSError, ValueError, KeyError, AttributeError):
+        return None
+
+
+def save_state(s):
+    try:
+        slim = {k: v for k, v in s.items() if k != "procs"}
+        slim["procs"] = {str(pid): [name, ticks] for pid, (name, ticks, _rss) in s["procs"].items()}
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(slim, f)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def main():
+    prev = load_state()
+    now = sample()
+    if not prev or now["t"] - prev["t"] > 120 or now["total"] < prev["total"]:
+        prev = now
+        time.sleep(0.3)
+        now = sample()
+
+    elapsed = max(now["t"] - prev["t"], 0.05)
+    d_total = max(now["total"] - prev["total"], 1)
+    d_idle = now["idle"] - prev["idle"]
+    cpu_pct = max(0.0, min(100.0, (1 - d_idle / d_total) * 100))
+
+    rows = []
+    for pid, (name, ticks, rss) in now["procs"].items():
+        old = prev["procs"].get(pid)
+        if old and old[0] == name:
+            d_ticks = ticks - old[1]
+        else:
+            d_ticks = 0
+        pct = d_ticks / CLK_TCK / elapsed * 100
+        rows.append({"pid": pid, "name": name, "cpu": round(pct, 1), "mem": rss})
+    by_cpu = sorted(rows, key=lambda r: (-r["cpu"], -r["mem"]))[:TOP_N]
+    by_mem = sorted(rows, key=lambda r: -r["mem"])[:TOP_N]
+
+    mem, swap = meminfo()
+    out = {
+        "cpu": round(cpu_pct, 1),
+        "cores": os.cpu_count() or 1,
+        "load": [round(x, 2) for x in os.getloadavg()],
+        "temp": temperature(),
+        "uptime": uptime(),
+        "mem": mem,
+        "swap": swap,
+        "disk": disk("/"),
+        "net": {"rx": (now["rx"] - prev["rx"]) / elapsed, "tx": (now["tx"] - prev["tx"]) / elapsed},
+        "procs": len(rows),
+        "topCpu": by_cpu,
+        "topMem": by_mem,
+    }
+    save_state(now)
+    json.dump(out, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

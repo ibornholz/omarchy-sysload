@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "ibornholz.sysload",
+  "name": "System load",
+  "version": "1.0.0",
+  "author": "Ingmar Bornholz",
+  "description": "CPU and memory pill with a btop-style detail popup",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "System load",
+    "description": "CPU and memory pill with a btop-style detail popup",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "interval": 3, "showMemory": true, "warnAt": 85 },
+    "schema": [
+      { "key": "interval", "type": "number", "label": "Refresh (seconds)" },
+      { "key": "showMemory", "type": "boolean", "label": "Show memory in bar" },
+      { "key": "warnAt", "type": "number", "label": "Highlight at % (CPU/memory)" }
+    ]
+  }
+}
